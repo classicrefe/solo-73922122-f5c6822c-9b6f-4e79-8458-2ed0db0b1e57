@@ -31,7 +31,7 @@ from .schemas import (
     ResultPayload,
     VerifyRequest,
 )
-from .worker import JobCoordinator
+from .worker import JobCoordinator, PatchLimitExceeded
 
 MAX_PIDS_PER_CHANNEL = 24
 
@@ -53,9 +53,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
         coordinator.stop()
         conn.close()
 
-    conn = db.connect(db_path)
-    db.init_db(conn)
-    coordinator = JobCoordinator(conn)
     app = FastAPI(
         title="录波补片核查 API",
         version="1.0.0",
@@ -93,22 +90,20 @@ def create_app(db_path: str | None = None) -> FastAPI:
             }
         incoming = list(dedup.values())
 
-        existing = {
-            p["pid"]
-            for p in db.fetch_patches(conn, accident_id, channel_id)
-        }
-        # 上限按“不同片号总数”计；同号替换不新增片号。
-        new_pids = {p["pid"] for p in incoming} - existing
-        if len(existing) + len(new_pids) > MAX_PIDS_PER_CHANNEL:
+        # 上限校验与写入 / 失效在协调器的同一把锁、同一个事务内完成，
+        # 避免并发补传突破 24 片上限，也保证写入失败时整体回滚。
+        try:
+            ack = coord.submit_patches(
+                accident_id,
+                channel_id,
+                incoming,
+                max_pids=MAX_PIDS_PER_CHANNEL,
+            )
+        except PatchLimitExceeded as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=(
-                    f"同一事故同一通道至多 {MAX_PIDS_PER_CHANNEL} 个不同片号，"
-                    f"当前已有 {len(existing)} 个，本次新增 {len(new_pids)} 个"
-                ),
-            )
-
-        ack = coord.submit_patches(accident_id, channel_id, incoming)
+                detail=str(exc),
+            ) from exc
         return PatchAck(**ack)
 
     @app.post(
@@ -172,7 +167,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         channel_id: str,
         coord: JobCoordinator = Depends(get_coordinator),
     ) -> dict:
-        patches = db.fetch_patches(conn, accident_id, channel_id)
+        patches = coord.list_patches(accident_id, channel_id)
         return {
             "accident_id": accident_id,
             "channel_id": channel_id,

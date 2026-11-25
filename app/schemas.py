@@ -79,3 +79,7 @@ class PatchAck(BaseModel):
     distinct_pid_count: int
     affected_active_result: bool
     generation: int
+    stale_job_ids: list[int] = Field(
+        default_factory=list,
+        description="本次补传同步标记为 stale 的待处理 / 运行中任务 id",
+    )
